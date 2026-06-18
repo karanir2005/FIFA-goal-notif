@@ -2,10 +2,11 @@
 
 Override these in your shell or in the cloud host's env settings:
 
-    NTFY_TOPIC    -> your private ntfy topic name (REQUIRED for real pushes)
-    NTFY_SERVER   -> ntfy server base url (default: https://ntfy.sh)
-    ESPN_LEAGUE   -> ESPN soccer league slug (default: eng.1 for testing)
-    POLL_SECONDS  -> how often to poll ESPN, in seconds (default: 3)
+    NTFY_TOPIC      -> your private ntfy topic name (REQUIRED for real pushes)
+    NTFY_SERVER     -> ntfy server base url (default: https://ntfy.sh)
+    DISCORD_WEBHOOK -> Discord channel webhook URL (optional, for group alerts)
+    ESPN_LEAGUE     -> ESPN soccer league slug (default: eng.1 for testing)
+    POLL_SECONDS    -> how often to poll ESPN, in seconds (default: 3)
 """
 
 import os
@@ -15,6 +16,10 @@ import os
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+
+# Discord channel webhook (Server Settings -> Integrations -> Webhooks).
+# Anyone in that channel gets the goal alerts too — good for sharing with friends.
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 
 # ESPN soccer league slug.
 #   eng.1   = Premier League (good for testing — frequently has live matches)

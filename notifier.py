@@ -106,7 +106,7 @@ def describe_goal(match: dict, scoring_team_id: str) -> str:
     return head
 
 
-def send_push(title: str, message: str) -> None:
+def send_ntfy(title: str, message: str) -> None:
     """Send a high-priority push to the ntfy topic."""
     if not config.NTFY_TOPIC:
         log.warning("NTFY_TOPIC not set — would have pushed: %s | %s", title, message)
@@ -127,9 +127,30 @@ def send_push(title: str, message: str) -> None:
             },
             timeout=10,
         )
-        log.info("PUSH SENT  %s | %s", title, message)
+        log.info("NTFY SENT  %s | %s", title, message)
     except requests.RequestException as e:
-        log.error("Failed to send push: %s", e)
+        log.error("Failed to send ntfy push: %s", e)
+
+
+def send_discord(title: str, message: str) -> None:
+    """Post the alert to a Discord channel via webhook, for group sharing."""
+    if not config.DISCORD_WEBHOOK:
+        return
+    try:
+        requests.post(
+            config.DISCORD_WEBHOOK,
+            json={"content": f"**{title}**\n{message}"},
+            timeout=10,
+        )
+        log.info("DISCORD SENT  %s | %s", title, message)
+    except requests.RequestException as e:
+        log.error("Failed to send Discord push: %s", e)
+
+
+def send_push(title: str, message: str) -> None:
+    """Send the alert to every configured channel (ntfy + Discord)."""
+    send_ntfy(title, message)
+    send_discord(title, message)
 
 
 def handle_match(match: dict, prime_only: bool) -> None:
@@ -215,10 +236,11 @@ def poll_once(prime_only: bool = False) -> None:
 
 def run_forever() -> None:
     log.info(
-        "Goal notifier starting | league=%s | poll=%ss | topic=%s",
+        "Goal notifier starting | league=%s | poll=%ss | ntfy_topic=%s | discord=%s",
         config.ESPN_LEAGUE,
         config.POLL_SECONDS,
         config.NTFY_TOPIC or "(unset!)",
+        "on" if config.DISCORD_WEBHOOK else "(unset)",
     )
     # Prime current scores silently so a restart mid-match doesn't spam.
     poll_once(prime_only=True)
