@@ -1,0 +1,19 @@
+# fly.toml app configuration file generated for rushil-goal-notif on 2026-06-18T16:17:23-04:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'rushil-goal-notif'
+primary_region = 'iad'
+
+[build]
+
+[env]
+  POLL_SECONDS = '3'
+
+# No [http_service] block: this is an outbound-only worker with no HTTP
+# server, so it must NOT be auto-stopped for "inactivity" or scaled to zero.
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
