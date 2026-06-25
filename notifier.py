@@ -37,6 +37,14 @@ ESPN_URL = (
 # goals that were already on the board.
 _last_scores: dict[str, tuple[int, int]] = {}
 
+# Per-match set of goal keys we've already notified about, e.g.
+# {event_id: {(team_id, clock_seconds, athlete_id), ...}}. A goal under VAR
+# review can make the score dip and then climb back to the same number a
+# few minutes later — comparing raw scores alone would treat that as a new
+# goal and notify twice. Keying on the goal's own identity instead means a
+# reinstated goal is recognized as "already seen" and stays quiet.
+_notified_goals: dict[str, set[tuple]] = {}
+
 # Match ids we've already sent a "starting soon" reminder for, so it only
 # fires once per match even though we poll every few seconds.
 _kickoff_alerted: set[str] = set()
@@ -80,25 +88,36 @@ def parse_event(event: dict) -> dict | None:
         return None
 
 
-def describe_goal(match: dict, scoring_team_id: str) -> str:
-    """Find the most recent goal in the details for the team that just scored,
-    and return a human string like 'Messi 23' (Goal - Penalty)'. Falls back to
-    '' if details aren't populated yet."""
-    goals = [
+def goals_for_team(match: dict, team_id: str) -> list[dict]:
+    """All scoring-play detail entries for one team, in feed order."""
+    return [
         d
         for d in match["details"]
         if d.get("scoringPlay")
-        and str(d.get("team", {}).get("id")) == str(scoring_team_id)
+        and str(d.get("team", {}).get("id")) == str(team_id)
     ]
-    if not goals:
-        return ""
-    g = goals[-1]  # latest goal for that team
+
+
+def goal_key(goal: dict) -> tuple:
+    """A stable identity for a goal that survives VAR back-and-forth: the
+    score doesn't uniquely identify a goal, but (team, clock, scorer) does."""
+    athletes = goal.get("athletesInvolved") or []
+    athlete_id = athletes[0].get("id") if athletes else ""
+    return (
+        str(goal.get("team", {}).get("id")),
+        goal.get("clock", {}).get("value"),
+        athlete_id,
+    )
+
+
+def describe_goal(goal: dict) -> str:
+    """Human string like 'Messi 23' (Goal - Penalty)' for one goal detail."""
     scorer = ""
-    athletes = g.get("athletesInvolved") or []
+    athletes = goal.get("athletesInvolved") or []
     if athletes:
         scorer = athletes[0].get("displayName", "")
-    minute = g.get("clock", {}).get("displayValue", "")
-    goal_type = g.get("type", {}).get("text", "Goal")
+    minute = goal.get("clock", {}).get("displayValue", "")
+    goal_type = goal.get("type", {}).get("text", "Goal")
     bits = [b for b in (scorer, minute) if b]
     head = " ".join(bits)
     if goal_type and goal_type != "Goal":
@@ -154,28 +173,48 @@ def send_push(title: str, message: str) -> None:
 
 
 def handle_match(match: dict, prime_only: bool) -> None:
-    """Compare this match's score to last-seen and notify on an increase."""
+    """Diff this match's goal list against what we've already notified for,
+    so VAR reviews (which can make ESPN's score dip and climb back to the
+    same number) don't cause the same goal to fire twice, and so a goal that
+    gets disallowed after the fact gets its own "revoked" push."""
     eid = match["id"]
+    seen = _notified_goals.setdefault(eid, set())
     cur = (match["home_score"], match["away_score"])
-    prev = _last_scores.get(eid)
+    was_primed = eid in _last_scores
     _last_scores[eid] = cur
 
-    if prime_only or prev is None:
-        # First time we see this match (or boot priming): record, don't notify.
+    if prime_only or not was_primed:
+        # First time we see this match (or boot priming): record every goal
+        # already on the board as "seen" so we don't fire for old goals, but
+        # don't notify.
+        for team_id in (match["home_id"], match["away_id"]):
+            for g in goals_for_team(match, team_id):
+                seen.add(goal_key(g))
         return
 
-    home_up = cur[0] > prev[0]
-    away_up = cur[1] > prev[1]
-    if not (home_up or away_up):
-        return  # no increase (score same, or went DOWN due to VAR — stay quiet)
+    for team_id in (match["home_id"], match["away_id"]):
+        for g in goals_for_team(match, team_id):
+            key = goal_key(g)
+            if key in seen:
+                continue
+            seen.add(key)
+            goal_str = describe_goal(g)
+            score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
+            title = "GOAL!"  # ntfy adds the ⚽ via the "soccer" tag (see send_push)
+            message = score_line if not goal_str else f"{score_line}  ({goal_str})"
+            send_push(title, message)
 
-    scoring_team_id = match["home_id"] if home_up else match["away_id"]
-    goal_str = describe_goal(match, scoring_team_id)
-
-    score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
-    title = "GOAL!"  # ntfy adds the ⚽ via the "soccer" tag (see send_push)
-    message = score_line if not goal_str else f"{score_line}  ({goal_str})"
-    send_push(title, message)
+    # A goal we'd already notified for can later disappear from the details
+    # list (VAR overturns it after confirmation) — tell the user it's been
+    # chalked off instead of staying silent.
+    still_present = set()
+    for team_id in (match["home_id"], match["away_id"]):
+        still_present.update(goal_key(g) for g in goals_for_team(match, team_id))
+    revoked = seen - still_present
+    if revoked:
+        seen -= revoked
+        score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
+        send_push("Goal disallowed", f"VAR review — {score_line}")
 
 
 def handle_kickoff_reminder(match: dict, prime_only: bool) -> None:
