@@ -100,13 +100,14 @@ def goals_for_team(match: dict, team_id: str) -> list[dict]:
 
 def goal_key(goal: dict) -> tuple:
     """A stable identity for a goal that survives VAR back-and-forth: the
-    score doesn't uniquely identify a goal, but (team, clock, scorer) does."""
-    athletes = goal.get("athletesInvolved") or []
-    athlete_id = athletes[0].get("id") if athletes else ""
+    score doesn't uniquely identify a goal, but (team, clock) does. Scorer
+    name/id is deliberately excluded — ESPN sometimes posts a goal before
+    athlete details are backfilled, and including it would make the key
+    change between polls for the same goal (looking like a new goal, or
+    worse, making the original key look "revoked")."""
     return (
         str(goal.get("team", {}).get("id")),
         goal.get("clock", {}).get("value"),
-        athlete_id,
     )
 
 
@@ -192,17 +193,33 @@ def handle_match(match: dict, prime_only: bool) -> None:
                 seen.add(goal_key(g))
         return
 
-    for team_id in (match["home_id"], match["away_id"]):
-        for g in goals_for_team(match, team_id):
-            key = goal_key(g)
-            if key in seen:
-                continue
-            seen.add(key)
-            goal_str = describe_goal(g)
-            score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
-            title = "GOAL!"  # ntfy adds the ⚽ via the "soccer" tag (see send_push)
-            message = score_line if not goal_str else f"{score_line}  ({goal_str})"
-            send_push(title, message)
+    # Walk every goal in chronological order so that if two goals land in the
+    # same poll cycle, each push shows the score as it stood right after that
+    # goal — not the match's final current score reused for both.
+    all_goals = [
+        (g, match["home_id"])
+        for g in goals_for_team(match, match["home_id"])
+    ] + [
+        (g, match["away_id"])
+        for g in goals_for_team(match, match["away_id"])
+    ]
+    all_goals.sort(key=lambda pair: pair[0].get("clock", {}).get("value") or 0)
+
+    home_running, away_running = 0, 0
+    for g, team_id in all_goals:
+        if team_id == match["home_id"]:
+            home_running += 1
+        else:
+            away_running += 1
+        key = goal_key(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        goal_str = describe_goal(g)
+        score_line = f"{match['home_name']} {home_running}-{away_running} {match['away_name']}"
+        title = "GOAL!"  # ntfy adds the ⚽ via the "soccer" tag (see send_push)
+        message = score_line if not goal_str else f"{score_line}  ({goal_str})"
+        send_push(title, message)
 
     # A goal we'd already notified for can later disappear from the details
     # list (VAR overturns it after confirmation) — tell the user it's been
