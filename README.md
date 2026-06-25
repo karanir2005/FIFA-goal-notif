@@ -4,7 +4,8 @@ Get an instant phone push **the moment a goal is scored** — before your TV cat
 can look up in time to watch it live.
 
 It polls [ESPN's free soccer API](https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard)
-every ~3 seconds, detects when a score goes up, and fires a push via [ntfy.sh](https://ntfy.sh).
+every ~3 seconds, detects when a score goes up, and fires a push via [ntfy.sh](https://ntfy.sh)
+and/or Discord.
 
 ## Quick start (local test)
 
@@ -29,6 +30,7 @@ every ~3 seconds, detects when a score goes up, and fires a push via [ntfy.sh](h
 |-----|---------|---------|
 | `NTFY_TOPIC` | _(none)_ | Your ntfy topic. **Required** for real pushes. |
 | `NTFY_SERVER` | `https://ntfy.sh` | ntfy server base URL. |
+| `DISCORD_WEBHOOK` | _(none)_ | Discord channel webhook for group alerts. Optional. |
 | `ESPN_LEAGUE` | `eng.1` | ESPN league slug. Use `fifa.world` for the World Cup. |
 | `POLL_SECONDS` | `3` | How often to poll ESPN. |
 
@@ -58,10 +60,11 @@ fly secrets set ESPN_LEAGUE=fifa.world
 
 ## How it avoids false / duplicate alerts
 
-- **Notifies only when a score increases** — a score dropping (VAR-disallowed goal) stays silent.
+- **Goals are tracked by identity** (team + clock + scorer), not raw score deltas — a goal that
+  flickers in ESPN's feed can never fire twice.
+- **VAR-disallowed goals get their own alert** ("Goal disallowed") instead of staying silent.
 - **Primes current scores silently on startup**, so a restart mid-match never re-fires for goals
   already on the board.
-- **One alert per goal**, keyed by match + score.
 - The poll loop **never crashes** on a bad response or network blip — it logs and retries.
 
 ## Commands
