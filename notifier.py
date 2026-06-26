@@ -45,16 +45,19 @@ _last_scores: dict[str, tuple[int, int]] = {}
 # reinstated goal is recognized as "already seen" and stays quiet.
 _notified_goals: dict[str, set[tuple]] = {}
 
+# Per-match score total (home + away) as of the last poll, used to confirm a
+# goal disappearing from the details feed actually corresponds to the
+# scoreboard number dropping — rather than the feed just being mid-update.
+_last_totals: dict[str, int] = {}
+
 # Match ids we've already sent a "starting soon" reminder for, so it only
 # fires once per match even though we poll every few seconds.
 _kickoff_alerted: set[str] = set()
 
 KICKOFF_WARNING_MINUTES = 5
 
-# Emoji per ESPN goal type.text, prefixed onto the message body so ntfy and
-# Discord show the same glyph (the ntfy Title header is Latin-1 only, so
-# emoji have to live in the body; Discord gets nothing unless we put it in
-# the text ourselves).
+# Emoji per ESPN goal type.text, prefixed onto the message body so Discord
+# (which has no tag/emoji concept) shows the right glyph.
 GOAL_EMOJI = {
     "goal": "⚽",
     "penalty": "🥅",
@@ -65,6 +68,22 @@ GOAL_EMOJI = {
 }
 DISALLOWED_EMOJI = "🚫"
 KICKOFF_EMOJI = "⏰"
+
+# ntfy renders its own emoji glyph in front of the title based on the "Tags"
+# header (an ntfy emoji-shortcode, not a literal char) — so this maps the
+# same goal type to ntfy's shortcode instead of duplicating GOAL_EMOJI's
+# literal char, which would otherwise show twice (once from ntfy's tag emoji,
+# once from the literal emoji we put in the body).
+NTFY_TAG = {
+    "goal": "soccer",
+    "penalty": "goal_net",
+    "own goal": "woozy_face",
+    "header": "crown",
+    "free-kick": "dart",
+    "free kick": "dart",
+}
+DISALLOWED_NTFY_TAG = "no_entry_sign"
+KICKOFF_NTFY_TAG = "alarm_clock"
 
 
 def fetch_scoreboard() -> list[dict]:
@@ -144,8 +163,11 @@ def describe_goal(goal: dict) -> str:
     return head
 
 
-def send_ntfy(title: str, message: str) -> None:
-    """Send a high-priority push to the ntfy topic."""
+def send_ntfy(title: str, message: str, tag: str = "soccer") -> None:
+    """Send a high-priority push to the ntfy topic. `tag` is an ntfy
+    emoji-shortcode (not a literal emoji char) — ntfy renders it once in
+    front of the title itself, so the message body shouldn't also carry a
+    literal emoji or it'll show twice."""
     if not config.NTFY_TOPIC:
         log.warning("NTFY_TOPIC not set — would have pushed: %s | %s", title, message)
         return
@@ -155,13 +177,10 @@ def send_ntfy(title: str, message: str) -> None:
             url,
             data=message.encode("utf-8"),
             headers={
-                # HTTP headers are Latin-1 only, so the title must be plain
-                # ASCII/Latin-1. The "soccer" tag below makes ntfy render a ⚽
-                # emoji on the notification automatically — that's where the
-                # emoji comes from, not the title string.
+                # HTTP headers are Latin-1 only, so the title must be plain ASCII/Latin-1.
                 "Title": title.encode("latin-1", "ignore").decode("latin-1"),
                 "Priority": "high",
-                "Tags": "soccer",
+                "Tags": tag,
             },
             timeout=10,
         )
@@ -185,10 +204,14 @@ def send_discord(title: str, message: str) -> None:
         log.error("Failed to send Discord push: %s", e)
 
 
-def send_push(title: str, message: str) -> None:
-    """Send the alert to every configured channel (ntfy + Discord)."""
-    send_ntfy(title, message)
-    send_discord(title, message)
+def send_push(title: str, message: str, emoji: str = "", tag: str = "soccer") -> None:
+    """Send the alert to every configured channel (ntfy + Discord).
+
+    `message` should be emoji-free; `emoji` (a literal char) is prefixed for
+    Discord, while ntfy gets `tag` (its emoji-shortcode) so each channel
+    shows the glyph exactly once instead of doubling up."""
+    send_ntfy(title, message, tag=tag)
+    send_discord(title, f"{emoji} {message}".strip())
 
 
 def handle_match(match: dict, prime_only: bool) -> None:
@@ -209,6 +232,7 @@ def handle_match(match: dict, prime_only: bool) -> None:
         for team_id in (match["home_id"], match["away_id"]):
             for g in goals_for_team(match, team_id):
                 seen.add(goal_key(g))
+        _last_totals[eid] = cur[0] + cur[1]
         return
 
     # Walk every goal in chronological order so that if two goals land in the
@@ -236,23 +260,35 @@ def handle_match(match: dict, prime_only: bool) -> None:
         goal_str = describe_goal(g)
         score_line = f"{match['home_name']} {home_running}-{away_running} {match['away_name']}"
         goal_type = g.get("type", {}).get("text", "Goal").removeprefix("Goal - ").lower()
-        emoji = GOAL_EMOJI.get(goal_type, GOAL_EMOJI["goal"])
         title = "GOAL!"  # kept ASCII — ntfy's Title header can't carry emoji (Latin-1 only)
         body = score_line if not goal_str else f"{score_line}  ({goal_str})"
-        message = f"{emoji} {body}"
-        send_push(title, message)
+        send_push(
+            title,
+            body,
+            emoji=GOAL_EMOJI.get(goal_type, GOAL_EMOJI["goal"]),
+            tag=NTFY_TAG.get(goal_type, NTFY_TAG["goal"]),
+        )
 
     # A goal we'd already notified for can later disappear from the details
-    # list (VAR overturns it after confirmation) — tell the user it's been
-    # chalked off instead of staying silent.
+    # list while ESPN's feed is still settling mid-review — that alone isn't
+    # reliable signal. Only treat it as an actual disallowed goal once the
+    # scoreboard number itself has dropped from what we last saw.
     still_present = set()
     for team_id in (match["home_id"], match["away_id"]):
         still_present.update(goal_key(g) for g in goals_for_team(match, team_id))
     revoked = seen - still_present
-    if revoked:
+    prev_total = _last_totals.get(eid, cur[0] + cur[1])
+    cur_total = cur[0] + cur[1]
+    if revoked and cur_total < prev_total:
         seen -= revoked
         score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
-        send_push("Goal disallowed", f"{DISALLOWED_EMOJI} VAR review — {score_line}")
+        send_push(
+            "Goal disallowed",
+            f"VAR review — {score_line}",
+            emoji=DISALLOWED_EMOJI,
+            tag=DISALLOWED_NTFY_TAG,
+        )
+    _last_totals[eid] = cur_total
 
 
 def handle_kickoff_reminder(match: dict, prime_only: bool) -> None:
@@ -281,8 +317,10 @@ def handle_kickoff_reminder(match: dict, prime_only: bool) -> None:
         _kickoff_alerted.add(eid)
         send_push(
             "Kickoff soon",
-            f"{KICKOFF_EMOJI} {match['home_name']} vs {match['away_name']} starts in "
+            f"{match['home_name']} vs {match['away_name']} starts in "
             f"{round(minutes_until)} min",
+            emoji=KICKOFF_EMOJI,
+            tag=KICKOFF_NTFY_TAG,
         )
 
 
@@ -328,7 +366,7 @@ def run_forever() -> None:
 
 def main() -> None:
     if "--test" in sys.argv:
-        send_push("GOAL!", "TEST — Argentina 1-0 France  (Messi 23')")
+        send_push("GOAL!", "TEST — Argentina 1-0 France  (Messi 23')", emoji=GOAL_EMOJI["goal"])
         return
     if "--once" in sys.argv:
         poll_once(prime_only=True)
