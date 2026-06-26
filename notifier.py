@@ -51,6 +51,21 @@ _kickoff_alerted: set[str] = set()
 
 KICKOFF_WARNING_MINUTES = 5
 
+# Emoji per ESPN goal type.text, prefixed onto the message body so ntfy and
+# Discord show the same glyph (the ntfy Title header is Latin-1 only, so
+# emoji have to live in the body; Discord gets nothing unless we put it in
+# the text ourselves).
+GOAL_EMOJI = {
+    "goal": "⚽",
+    "penalty": "🥅",
+    "own goal": "🥴",
+    "header": "👑",
+    "free-kick": "🎯",
+    "free kick": "🎯",
+}
+DISALLOWED_EMOJI = "🚫"
+KICKOFF_EMOJI = "⏰"
+
 
 def fetch_scoreboard() -> list[dict]:
     """Return the list of event dicts from ESPN, or [] on any failure."""
@@ -112,13 +127,16 @@ def goal_key(goal: dict) -> tuple:
 
 
 def describe_goal(goal: dict) -> str:
-    """Human string like 'Messi 23' (Goal - Penalty)' for one goal detail."""
+    """Human string like 'Messi 23' (Penalty)' for one goal detail."""
     scorer = ""
     athletes = goal.get("athletesInvolved") or []
     if athletes:
         scorer = athletes[0].get("displayName", "")
     minute = goal.get("clock", {}).get("displayValue", "")
     goal_type = goal.get("type", {}).get("text", "Goal")
+    # ESPN sometimes prefixes the type with "Goal - " (e.g. "Goal - Free-kick")
+    # even though it's already obviously a goal — drop the redundant prefix.
+    goal_type = goal_type.removeprefix("Goal - ")
     bits = [b for b in (scorer, minute) if b]
     head = " ".join(bits)
     if goal_type and goal_type != "Goal":
@@ -217,8 +235,11 @@ def handle_match(match: dict, prime_only: bool) -> None:
         seen.add(key)
         goal_str = describe_goal(g)
         score_line = f"{match['home_name']} {home_running}-{away_running} {match['away_name']}"
-        title = "GOAL!"  # ntfy adds the ⚽ via the "soccer" tag (see send_push)
-        message = score_line if not goal_str else f"{score_line}  ({goal_str})"
+        goal_type = g.get("type", {}).get("text", "Goal").removeprefix("Goal - ").lower()
+        emoji = GOAL_EMOJI.get(goal_type, GOAL_EMOJI["goal"])
+        title = "GOAL!"  # kept ASCII — ntfy's Title header can't carry emoji (Latin-1 only)
+        body = score_line if not goal_str else f"{score_line}  ({goal_str})"
+        message = f"{emoji} {body}"
         send_push(title, message)
 
     # A goal we'd already notified for can later disappear from the details
@@ -231,7 +252,7 @@ def handle_match(match: dict, prime_only: bool) -> None:
     if revoked:
         seen -= revoked
         score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
-        send_push("Goal disallowed", f"VAR review — {score_line}")
+        send_push("Goal disallowed", f"{DISALLOWED_EMOJI} VAR review — {score_line}")
 
 
 def handle_kickoff_reminder(match: dict, prime_only: bool) -> None:
@@ -260,7 +281,7 @@ def handle_kickoff_reminder(match: dict, prime_only: bool) -> None:
         _kickoff_alerted.add(eid)
         send_push(
             "Kickoff soon",
-            f"{match['home_name']} vs {match['away_name']} starts in "
+            f"{KICKOFF_EMOJI} {match['home_name']} vs {match['away_name']} starts in "
             f"{round(minutes_until)} min",
         )
 
