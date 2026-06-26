@@ -37,13 +37,18 @@ ESPN_URL = (
 # goals that were already on the board.
 _last_scores: dict[str, tuple[int, int]] = {}
 
-# Per-match set of goal keys we've already notified about, e.g.
-# {event_id: {(team_id, clock_seconds, athlete_id), ...}}. A goal under VAR
-# review can make the score dip and then climb back to the same number a
-# few minutes later — comparing raw scores alone would treat that as a new
-# goal and notify twice. Keying on the goal's own identity instead means a
-# reinstated goal is recognized as "already seen" and stays quiet.
-_notified_goals: dict[str, set[tuple]] = {}
+# Per-match, per-team count of goals already pushed, e.g.
+# {event_id: {team_id: count, ...}}. This is the cache of "the previous
+# known score" the dedup decision is built on. A new push fires only when a
+# team's goal-list *length* grows past the stored count for that team in
+# that match — never by comparing a goal entry's own fields (clock value,
+# scorer name) across polls, since ESPN often posts a scoring play with
+# rough/incomplete metadata first and backfills exact fields a poll or two
+# later. Keying dedup on those fields would make the same goal's identity
+# shift mid-flight and look "new" again — which is exactly what caused the
+# same goal to push 2-3 duplicate notifications once two matches were live
+# at once and ESPN's feed had more updates in flight to settle.
+_notified_count: dict[str, dict[str, int]] = {}
 
 # Per-match score total (home + away) as of the last poll, used to confirm a
 # goal disappearing from the details feed actually corresponds to the
@@ -132,19 +137,6 @@ def goals_for_team(match: dict, team_id: str) -> list[dict]:
     ]
 
 
-def goal_key(goal: dict) -> tuple:
-    """A stable identity for a goal that survives VAR back-and-forth: the
-    score doesn't uniquely identify a goal, but (team, clock) does. Scorer
-    name/id is deliberately excluded — ESPN sometimes posts a goal before
-    athlete details are backfilled, and including it would make the key
-    change between polls for the same goal (looking like a new goal, or
-    worse, making the original key look "revoked")."""
-    return (
-        str(goal.get("team", {}).get("id")),
-        goal.get("clock", {}).get("value"),
-    )
-
-
 def describe_goal(goal: dict) -> str:
     """Human string like 'Messi 23' (Penalty)' for one goal detail."""
     scorer = ""
@@ -215,48 +207,54 @@ def send_push(title: str, message: str, emoji: str = "", tag: str = "soccer") ->
 
 
 def handle_match(match: dict, prime_only: bool) -> None:
-    """Diff this match's goal list against what we've already notified for,
-    so VAR reviews (which can make ESPN's score dip and climb back to the
-    same number) don't cause the same goal to fire twice, and so a goal that
-    gets disallowed after the fact gets its own "revoked" push."""
+    """Diff this match's per-team goal *count* against what we've already
+    notified for — each match is isolated under its own `eid` (ESPN's event
+    id), so two matches live at once never share state. Counting (rather
+    than matching on a goal's own clock/scorer fields) is what makes this
+    immune to ESPN backfilling a goal's metadata a poll or two after it
+    first appears: the team's goal list is still the same length in the
+    meantime, so a field changing underneath an already-counted goal can
+    never look like a second, new goal. A goal disallowed after the fact
+    only fires a "revoked" push once the scoreboard's own number has
+    dropped too, so a goal that's just briefly missing mid-review (without
+    the score itself dropping) stays quiet and self-heals next poll."""
     eid = match["id"]
-    seen = _notified_goals.setdefault(eid, set())
+    home_id, away_id = match["home_id"], match["away_id"]
+    counts = _notified_count.setdefault(eid, {home_id: 0, away_id: 0})
     cur = (match["home_score"], match["away_score"])
     was_primed = eid in _last_scores
     _last_scores[eid] = cur
 
+    home_goals = goals_for_team(match, home_id)
+    away_goals = goals_for_team(match, away_id)
+
     if prime_only or not was_primed:
-        # First time we see this match (or boot priming): record every goal
-        # already on the board as "seen" so we don't fire for old goals, but
-        # don't notify.
-        for team_id in (match["home_id"], match["away_id"]):
-            for g in goals_for_team(match, team_id):
-                seen.add(goal_key(g))
+        # First time we see this match (or boot priming): record the goals
+        # already on the board as "already notified" so we don't fire for
+        # old goals, but don't notify.
+        counts[home_id] = len(home_goals)
+        counts[away_id] = len(away_goals)
         _last_totals[eid] = cur[0] + cur[1]
         return
 
-    # Walk every goal in chronological order so that if two goals land in the
-    # same poll cycle, each push shows the score as it stood right after that
-    # goal — not the match's final current score reused for both.
-    all_goals = [
-        (g, match["home_id"])
-        for g in goals_for_team(match, match["home_id"])
-    ] + [
-        (g, match["away_id"])
-        for g in goals_for_team(match, match["away_id"])
-    ]
-    all_goals.sort(key=lambda pair: pair[0].get("clock", {}).get("value") or 0)
+    already_home, already_away = counts[home_id], counts[away_id]
 
-    home_running, away_running = 0, 0
-    for g, team_id in all_goals:
-        if team_id == match["home_id"]:
+    # Only the tail beyond what we've already notified for each team is
+    # new — goals_for_team preserves ESPN's feed order, which is
+    # chronological, so this is the slice of genuinely new goals.
+    new_goals = [(g, home_id) for g in home_goals[already_home:]]
+    new_goals += [(g, away_id) for g in away_goals[already_away:]]
+    # Re-sort so that if two goals (one per team) land in the same poll
+    # cycle, each push shows the score as it stood right after that goal —
+    # not the match's final current score reused for both.
+    new_goals.sort(key=lambda pair: pair[0].get("clock", {}).get("value") or 0)
+
+    home_running, away_running = already_home, already_away
+    for g, team_id in new_goals:
+        if team_id == home_id:
             home_running += 1
         else:
             away_running += 1
-        key = goal_key(g)
-        if key in seen:
-            continue
-        seen.add(key)
         goal_str = describe_goal(g)
         score_line = f"{match['home_name']} {home_running}-{away_running} {match['away_name']}"
         goal_type = g.get("type", {}).get("text", "Goal").removeprefix("Goal - ").lower()
@@ -269,18 +267,23 @@ def handle_match(match: dict, prime_only: bool) -> None:
             tag=NTFY_TAG.get(goal_type, NTFY_TAG["goal"]),
         )
 
-    # A goal we'd already notified for can later disappear from the details
-    # list while ESPN's feed is still settling mid-review — that alone isn't
-    # reliable signal. Only treat it as an actual disallowed goal once the
-    # scoreboard number itself has dropped from what we last saw.
-    still_present = set()
-    for team_id in (match["home_id"], match["away_id"]):
-        still_present.update(goal_key(g) for g in goals_for_team(match, team_id))
-    revoked = seen - still_present
+    if len(home_goals) > already_home:
+        counts[home_id] = len(home_goals)
+    if len(away_goals) > already_away:
+        counts[away_id] = len(away_goals)
+
+    # A team's goal count dropping back below what we've notified for can
+    # mean a goal disappeared from the details feed while ESPN is still
+    # settling a VAR review — that alone isn't reliable signal. Only treat
+    # it as an actual disallowed goal once the scoreboard number itself has
+    # dropped from what we last saw.
     prev_total = _last_totals.get(eid, cur[0] + cur[1])
     cur_total = cur[0] + cur[1]
-    if revoked and cur_total < prev_total:
-        seen -= revoked
+    if cur_total < prev_total:
+        if len(home_goals) < counts[home_id]:
+            counts[home_id] = len(home_goals)
+        if len(away_goals) < counts[away_id]:
+            counts[away_id] = len(away_goals)
         score_line = f"{match['home_name']} {cur[0]}-{cur[1]} {match['away_name']}"
         send_push(
             "Goal disallowed",

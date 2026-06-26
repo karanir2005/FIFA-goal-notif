@@ -60,8 +60,12 @@ fly secrets set ESPN_LEAGUE=fifa.world
 
 ## How it avoids false / duplicate alerts
 
-- **Goals are tracked by identity** (team + clock + scorer), not raw score deltas — a goal that
-  flickers in ESPN's feed can never fire twice.
+- **Each match is tracked independently**, keyed by ESPN's own event id, so two matches kicking
+  off at the same time never share or collide on state.
+- **Goals are tracked by per-team count, not by a goal's own fields** — a goal's clock/scorer
+  details can get backfilled by ESPN a poll or two after it first appears (more likely when
+  several matches are live at once), and a naive identity match would treat that as a second,
+  new goal. Counting only fires when a team's goal list actually grows.
 - **VAR-disallowed goals get their own alert** ("Goal disallowed") instead of staying silent.
 - **Primes current scores silently on startup**, so a restart mid-match never re-fires for goals
   already on the board.
